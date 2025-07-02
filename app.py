@@ -1,4 +1,5 @@
 import os
+import json
 import streamlit as st
 from typing import List, Tuple, Dict, Any
 from langchain_community.document_loaders import TextLoader, PyPDFLoader, PythonLoader, UnstructuredMarkdownLoader, UnstructuredFileLoader
@@ -13,12 +14,48 @@ from dotenv import load_dotenv
 from langchain.prompts import PromptTemplate
 import requests
 from bs4 import BeautifulSoup
+import time
 
 # --- Load environment variables from .env file ---
 load_dotenv()
 DEFAULT_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
+UPLOAD_DIR = "uploaded_files"
+KB_JSON_PATH = "knowledge_base.json"
 SUPPORTED_EXTENSIONS = [".txt", ".md", ".pdf", ".py", ".js", ".json", ".yaml", ".yml"]
+
+# --- Ensure upload directory and knowledge base JSON exist ---
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+if not os.path.exists(KB_JSON_PATH):
+    with open(KB_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump([], f)
+
+# --- Persistent Knowledge Base Functions ---
+def load_persistent_kb():
+    if os.path.exists(KB_JSON_PATH):
+        with open(KB_JSON_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+def save_persistent_kb(kb):
+    with open(KB_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(kb, f, indent=2)
+
+# --- Session State Initialization (must be before any use) ---
+if "knowledge_base" not in st.session_state:
+    st.session_state["knowledge_base"] = load_persistent_kb()
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []
+if "vectorstore" not in st.session_state:
+    st.session_state["vectorstore"] = None
+if "qa_chain" not in st.session_state:
+    st.session_state["qa_chain"] = None
+if "openai_api_key" not in st.session_state:
+    st.session_state["openai_api_key"] = ""
+if "doc_folder" not in st.session_state:
+    st.session_state["doc_folder"] = ""
+if "url_input" not in st.session_state:
+    st.session_state["url_input"] = ""
 
 # --- Utility Functions ---
 def get_files_in_folder(folder_path: str) -> List[str]:
@@ -114,81 +151,71 @@ def load_url_content(url: str) -> List[Any]:
 
 # --- Streamlit UI ---
 st.set_page_config(page_title="RAG Document Chat", page_icon="📄", layout="wide")
-st.title("📄 RAG Document Chat App")
+st.title('RAG Based Document QA')
+# Remove the default Streamlit title and divider for a cleaner look
+# st.title("📄 RAG Document Chat App")
+# st.markdown("---")
 
 # --- Sidebar ---
-st.sidebar.header("Configuration")
-# Remove OpenAI API Key textbox; always use .env
-openai_api_key = DEFAULT_OPENAI_API_KEY
+st.sidebar.header("Knowledge Base Management")
 
-# Folder selection using Streamlit's directory picker (experimental) or file_uploader for multiple files
-folder_picker = st.sidebar.text_input("Documents Folder Path", value=st.session_state.get("doc_folder", ""))
-# If running locally, allow user to pick a folder using st.sidebar.file_uploader (workaround: user uploads a file from the folder, we use its parent)
-uploaded_file = st.sidebar.file_uploader("Or select a file from your folder (to auto-detect folder)", type=None)
-if uploaded_file is not None:
-    # Save uploaded file to a temp location to get its path
-    temp_file_path = os.path.join(tempfile.gettempdir(), uploaded_file.name)
-    with open(temp_file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    detected_folder = os.path.dirname(temp_file_path)
-    folder_picker = detected_folder
-    st.sidebar.info(f"Detected folder: {detected_folder}")
+# --- Upload Files Section ---
+st.sidebar.subheader("Upload Files")
+uploaded_files = st.sidebar.file_uploader(
+    "Add files to your knowledge base:",
+    type=[ext[1:] for ext in SUPPORTED_EXTENSIONS],
+    accept_multiple_files=True
+)
+if uploaded_files:
+    kb = st.session_state["knowledge_base"]
+    new_files = []
+    for uploaded_file in uploaded_files:
+        save_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
+        with open(save_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        if not any(entry["name"] == uploaded_file.name for entry in kb):
+            kb.append({"name": uploaded_file.name, "path": save_path, "type": "file"})
+            new_files.append(save_path)
+    save_persistent_kb(kb)
+    st.session_state["knowledge_base"] = kb
+    # Immediately load all KB files into vectorstore and enable chat
+    if kb:
+        all_docs = []
+        for entry in kb:
+            all_docs.extend(load_single_document(entry["path"]))
+        if all_docs:
+            chunked_docs = chunk_documents(all_docs)
+            vectorstore = create_vectorstore(chunked_docs, DEFAULT_OPENAI_API_KEY)
+            qa_chain = get_qa_chain(vectorstore, DEFAULT_OPENAI_API_KEY)
+            st.session_state["vectorstore"] = vectorstore
+            st.session_state["qa_chain"] = qa_chain
+    st.sidebar.success(f"Uploaded {len(uploaded_files)} file(s). They will persist across refreshes and chat is now enabled.")
+    st.rerun()
 
-# URL input
-url_input = st.sidebar.text_input("Or paste a website URL to load its content", value=st.session_state.get("url_input", ""))
+# --- Display Uploaded Files Section ---
+st.sidebar.subheader("Knowledge Base Files")
+kb = st.session_state["knowledge_base"]
+if not kb:
+    st.sidebar.info("No files uploaded yet.")
+else:
+    for i, entry in enumerate(kb):
+        st.sidebar.write(f"{entry['name']}")
+        if st.sidebar.button(f"Delete {entry['name']}", key=f"del_{i}"):
+            if os.path.exists(entry["path"]):
+                os.remove(entry["path"])
+            kb.pop(i)
+            save_persistent_kb(kb)
+            st.session_state["knowledge_base"] = kb
+            st.rerun()
+
+# --- Web URL Loader Section ---
+st.sidebar.subheader("Add Webpage URL")
+url_input = st.sidebar.text_input("Paste a website URL to load its content:", value=st.session_state.get("url_input", ""))
 load_url_btn = st.sidebar.button("Load URL")
-
-doc_folder = folder_picker
-load_btn = st.sidebar.button("Load Documents")
-clear_chat_btn = st.sidebar.button("Clear Chat History")
-
-# --- Session State ---
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
-if "vectorstore" not in st.session_state:
-    st.session_state["vectorstore"] = None
-if "qa_chain" not in st.session_state:
-    st.session_state["qa_chain"] = None
-if "openai_api_key" not in st.session_state:
-    st.session_state["openai_api_key"] = ""
-if "doc_folder" not in st.session_state:
-    st.session_state["doc_folder"] = ""
-if "url_input" not in st.session_state:
-    st.session_state["url_input"] = ""
-
-# --- Load Documents ---
-if load_btn:
-    if not openai_api_key:
-        st.sidebar.error("OpenAI API key not found in .env file.")
-    elif not doc_folder or not os.path.isdir(doc_folder):
-        st.sidebar.error("Please enter a valid folder path.")
-    else:
-        st.session_state["openai_api_key"] = openai_api_key
-        st.session_state["doc_folder"] = doc_folder
-        st.session_state["url_input"] = ""
-        with st.spinner("Loading and processing documents from folder..."):
-            try:
-                docs = load_documents(doc_folder)
-                if not docs:
-                    st.sidebar.error("No supported documents found in the folder.")
-                else:
-                    chunked_docs = chunk_documents(docs)
-                    vectorstore = create_vectorstore(chunked_docs, openai_api_key)
-                    qa_chain = get_qa_chain(vectorstore, openai_api_key)
-                    st.session_state["vectorstore"] = vectorstore
-                    st.session_state["qa_chain"] = qa_chain
-                    st.success(f"Loaded {len(docs)} documents, {len(chunked_docs)} chunks from folder.")
-            except Exception as e:
-                st.sidebar.error(f"Error loading documents: {e}")
-
-# --- Load Content from URL ---
 if load_url_btn:
-    if not openai_api_key:
-        st.sidebar.error("OpenAI API key not found in .env file.")
-    elif not url_input or not url_input.startswith("http"):
+    if not url_input or not url_input.startswith("http"):
         st.sidebar.error("Please enter a valid URL.")
     else:
-        st.session_state["openai_api_key"] = openai_api_key
         st.session_state["url_input"] = url_input
         st.session_state["doc_folder"] = ""
         with st.spinner("Fetching and processing webpage content..."):
@@ -198,57 +225,124 @@ if load_url_btn:
                     st.sidebar.error("No content could be loaded from the URL.")
                 else:
                     chunked_docs = chunk_documents(docs)
-                    vectorstore = create_vectorstore(chunked_docs, openai_api_key)
-                    qa_chain = get_qa_chain(vectorstore, openai_api_key)
+                    vectorstore = create_vectorstore(chunked_docs, DEFAULT_OPENAI_API_KEY)
+                    qa_chain = get_qa_chain(vectorstore, DEFAULT_OPENAI_API_KEY)
                     st.session_state["vectorstore"] = vectorstore
                     st.session_state["qa_chain"] = qa_chain
-                    st.success(f"Loaded and processed content from URL.")
+                    st.sidebar.success(f"Loaded and processed content from URL.")
             except Exception as e:
                 st.sidebar.error(f"Error loading URL: {e}")
+        st.rerun()
 
-# --- Clear Chat ---
-if clear_chat_btn:
+# --- Chat Management Section ---
+st.sidebar.subheader("Chat Management")
+if st.sidebar.button("Clear Chat History"):
     st.session_state["chat_history"] = []
 
 # --- Main Chat Area ---
-st.markdown("---")
-if st.session_state["qa_chain"] is None:
-    st.info("Please configure and load your documents or a website to start chatting.")
-else:
-    with st.form("chat_form", clear_on_submit=True):
-        user_input = st.text_area("Ask a question about your documents or the website:", height=80)
-        submitted = st.form_submit_button("Send")
-    if submitted and user_input:
-        with st.spinner("Generating answer..."):
+# Remove fixed CSS and custom divs for chat input and answer section
+# Just use Streamlit layout for stacking
+
+# Chat history area (user questions)
+for chat in st.session_state["chat_history"][::-1]:
+    st.markdown(f"**You:** {chat['question']}")
+
+# Place the chat form in the main Streamlit flow so submission always works
+with st.form("chat_form", clear_on_submit=True):
+    user_input = st.text_area("Ask a question:", height=80)
+    submitted = st.form_submit_button("Send")
+if submitted and user_input:
+    with st.spinner("Generating answer..."):
+        if st.session_state["qa_chain"] is not None:
             try:
                 result = st.session_state["qa_chain"].invoke({"query": user_input})
                 answer = result["result"]
                 sources = result.get("source_documents", [])
+                # --- Streaming effect ---
+                chat_placeholder = st.empty()
+                streamed = ""
+                for token in answer.split():
+                    streamed += token + " "
+                    chat_placeholder.markdown(
+                        f'<div style="background:#f1f5f9;color:#1e293b;padding:1em;border-radius:8px;margin-bottom:0.5em;">'
+                        f'<b>🤖 Assistant:</b> {streamed.strip()}<span style="color:#3b82f6;font-weight:600;animation:blink 1s steps(2, start) infinite;">|</span></div>'
+                        '<style>@keyframes blink { to { visibility: hidden; } }</style>',
+                        unsafe_allow_html=True
+                    )
+                    time.sleep(0.04)
+                chat_placeholder.markdown(
+                    f'<div style="background:#f1f5f9;color:#1e293b;padding:1em;border-radius:8px;margin-bottom:0.5em;">'
+                    f'<b>🤖 Assistant:</b> {answer}</div>',
+                    unsafe_allow_html=True
+                )
+            except Exception as e:
+                answer = f"Error: {e}"
+                sources = []
+            finally:
                 st.session_state["chat_history"].append({
                     "question": user_input,
                     "answer": answer,
                     "sources": sources
                 })
-            except openai.error.AuthenticationError:
-                st.error("Invalid OpenAI API key.")
-            except Exception as e:
-                st.error(f"Error during QA: {e}")
+                st.rerun()
+        else:
+            answer = "Please upload files or load a URL to enable document Q&A."
+            sources = []
+            st.session_state["chat_history"].append({
+                "question": user_input,
+                "answer": answer,
+                "sources": sources
+            })
+            st.rerun()
 
-    # Display chat history
+# --- Dedicated Answer Section (scrollable) ---
+# Use a Streamlit container with a max height and scroll if needed
+st.markdown("<hr style='margin:1.5em 0;'>", unsafe_allow_html=True)
+st.markdown("<b>Assistant Answers</b>", unsafe_allow_html=True)
+with st.container():
+    st.markdown(
+        """
+        <style>
+        .answer-scroll {
+            max-height: 220px;
+            overflow-y: auto;
+            padding-right: 0.5em;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    st.markdown('<div class="answer-scroll">', unsafe_allow_html=True)
     for chat in st.session_state["chat_history"][::-1]:
-        st.markdown(f"**You:** {chat['question']}")
-        st.markdown(f"**Answer:** {chat['answer']}")
-        if chat["sources"]:
-            st.markdown("**Sources:**")
-            for i, src in enumerate(chat["sources"]):
-                meta = src.metadata
-                fname = meta.get("source", "Unknown")
-                page = meta.get("page", None)
-                if page is not None:
-                    st.markdown(f"- `{fname}` (page {page+1})")
-                else:
-                    st.markdown(f"- `{fname}`")
-        st.markdown("---")
+        st.markdown(
+            f'<div style="background:#f1f5f9;color:#1e293b;padding:1em;border-radius:8px;margin-bottom:0.5em;">'
+            f'<b>🤖 Assistant:</b> {chat["answer"]}'
+            + (
+                f'<div style="background:#e8eef6;margin-top:0.7em;margin-left:1.5em;padding:0.7em 1em;border-radius:7px;"><span style="color:#3b82f6;font-weight:600;">Sources:</span><ul style="margin:0.3em 0 0 1.2em;padding:0;">' +
+                ''.join(
+                    f'<li style="color:#64748b;font-size:0.97em;">'
+                    f'{src.metadata.get("source", "Unknown")}'
+                    + (f' <span style="color:#94a3b8;">(page {src.metadata.get("page")+1})</span>' if src.metadata.get("page") is not None else "")
+                    + '</li>'
+                    for src in chat["sources"]
+                ) + '</ul></div>' if chat["sources"] else ''
+            ) +
+            '</div>',
+            unsafe_allow_html=True
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
 
 # --- Footer ---
-st.markdown("<small>Built with Streamlit, LangChain, OpenAI, and FAISS. | [GitHub](https://github.com/)</small>", unsafe_allow_html=True) 
+st.markdown("<small>Built with Streamlit, LangChain, OpenAI, and FAISS. | [GitHub](https://github.com/)</small>", unsafe_allow_html=True)
+
+# --- Auto-load vectorstore and QA chain if files are present and not loaded ---
+if st.session_state["qa_chain"] is None and st.session_state["knowledge_base"]:
+    all_docs = []
+    for entry in st.session_state["knowledge_base"]:
+        all_docs.extend(load_single_document(entry["path"]))
+    if all_docs:
+        chunked_docs = chunk_documents(all_docs)
+        vectorstore = create_vectorstore(chunked_docs, DEFAULT_OPENAI_API_KEY)
+        qa_chain = get_qa_chain(vectorstore, DEFAULT_OPENAI_API_KEY)
+        st.session_state["vectorstore"] = vectorstore
+        st.session_state["qa_chain"] = qa_chain 
