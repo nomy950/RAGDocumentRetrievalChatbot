@@ -198,15 +198,65 @@ kb = st.session_state["knowledge_base"]
 if not kb:
     st.sidebar.info("No files uploaded yet.")
 else:
+    st.sidebar.markdown(
+        """
+        <style>
+        .kb-file-card {
+            background: #f1f5f9;
+            border-radius: 6px;
+            padding: 0.35em 0.7em 0.35em 0.7em;
+            margin-bottom: 0.25em;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            min-height: 28px;
+        }
+        .kb-file-name {
+            color: #1e293b;
+            font-weight: 500;
+            font-size: 0.97em;
+            overflow-wrap: anywhere;
+            white-space: normal;
+            margin-right: 0.5em;
+        }
+        .kb-url-icon {
+            color: #3b82f6;
+            margin-right: 0.4em;
+            font-size: 1.1em;
+        }
+        .kb-delete-btn {
+            background: none;
+            border: none;
+            color: #ef4444;
+            font-size: 1.05em;
+            cursor: pointer;
+            margin-left: 0.5em;
+            padding: 0;
+        }
+        .kb-delete-btn:hover {
+            color: #b91c1c;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
     for i, entry in enumerate(kb):
-        st.sidebar.write(f"{entry['name']}")
-        if st.sidebar.button(f"Delete {entry['name']}", key=f"del_{i}"):
-            if os.path.exists(entry["path"]):
-                os.remove(entry["path"])
-            kb.pop(i)
-            save_persistent_kb(kb)
-            st.session_state["knowledge_base"] = kb
-            st.rerun()
+        col1, col2 = st.sidebar.columns([10,1])
+        with col1:
+            if entry["type"] == "url":
+                st.markdown(f'<div class="kb-file-card"><span class="kb-url-icon">🔗</span><span class="kb-file-name">{entry["name"]}</span>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="kb-file-card"><span class="kb-file-name">{entry["name"]}</span>', unsafe_allow_html=True)
+        with col2:
+            if st.button("❌", key=f"del_{i}", help=f"Delete {entry['name']}"):
+                # Remove file from disk if it's a file
+                if entry["type"] == "file" and os.path.exists(entry["path"]):
+                    os.remove(entry["path"])
+                kb.pop(i)
+                save_persistent_kb(kb)
+                st.session_state["knowledge_base"] = kb
+                st.rerun()
+        st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
 # --- Web URL Loader Section ---
 st.sidebar.subheader("Add Webpage URL")
@@ -224,6 +274,12 @@ if load_url_btn:
                 if not docs:
                     st.sidebar.error("No content could be loaded from the URL.")
                 else:
+                    # --- Add URL to persistent knowledge base if not already present ---
+                    kb = st.session_state["knowledge_base"]
+                    if not any(entry["type"] == "url" and entry["path"] == url_input for entry in kb):
+                        kb.append({"name": url_input, "path": url_input, "type": "url"})
+                        save_persistent_kb(kb)
+                        st.session_state["knowledge_base"] = kb
                     chunked_docs = chunk_documents(docs)
                     vectorstore = create_vectorstore(chunked_docs, DEFAULT_OPENAI_API_KEY)
                     qa_chain = get_qa_chain(vectorstore, DEFAULT_OPENAI_API_KEY)
@@ -335,11 +391,14 @@ with st.container():
 # --- Footer ---
 st.markdown("<small>Built with Streamlit, LangChain, OpenAI, and FAISS. | [GitHub](https://github.com/)</small>", unsafe_allow_html=True)
 
-# --- Auto-load vectorstore and QA chain if files are present and not loaded ---
+# --- Auto-load vectorstore and QA chain if files or URLs are present and not loaded ---
 if st.session_state["qa_chain"] is None and st.session_state["knowledge_base"]:
     all_docs = []
     for entry in st.session_state["knowledge_base"]:
-        all_docs.extend(load_single_document(entry["path"]))
+        if entry["type"] == "file":
+            all_docs.extend(load_single_document(entry["path"]))
+        elif entry["type"] == "url":
+            all_docs.extend(load_url_content(entry["path"]))
     if all_docs:
         chunked_docs = chunk_documents(all_docs)
         vectorstore = create_vectorstore(chunked_docs, DEFAULT_OPENAI_API_KEY)
